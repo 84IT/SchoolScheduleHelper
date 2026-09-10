@@ -1,0 +1,78 @@
+{
+  "school_year": "2026/2027",
+  "source": "MON (Bulgaria) official order 'Grafik na uchebnoto vreme 2026/2027', published 31.08.2026; cross-checked against az-buki.bg (MON press office), boulevardbulgaria.bg, dbr.bg, smarty-kids.bg (all week of 2026-09-01)",
+  "retrieved": "2026-09-09",
+  "start_of_school_year": "2026-09-15",
+  "second_term_start": "2027-02-03",
+  "vacations_all_grades_except_note": [
+    {
+      "name": "Есенна ваканция",
+      "start": "2026-10-31",
+      "end": "2026-11-02"
+    },
+    {
+      "name": "Коледна ваканция",
+      "start": "2026-12-24",
+      "end": "2027-01-03"
+    },
+    {
+      "name": "Междусрочна ваканция",
+      "start": "2027-01-30",
+      "end": "2027-02-02"
+    },
+    {
+      "name": "Пролетна ваканция (I-XI клас)",
+      "start": "2027-04-03",
+      "end": "2027-04-11"
+    },
+    {
+      "name": "Великденска и Гергьовденска ваканция (I-XI клас, слети)",
+      "start": "2027-04-30",
+      "end": "2027-05-09",
+      "note": "includes 5 and 7 May, non-teaching only for grades I-XI; XII grade has classes those two days"
+    },
+    {
+      "name": "Ваканция около 24 май (Ден на българската писменост)",
+      "start": "2027-05-22",
+      "end": "2027-05-25",
+      "note": "22-23 May weekend, 24 May official holiday, 25 May traditionally declared non-teaching"
+    }
+  ],
+  "grade_12_spring_break_override": {
+    "name": "Пролетна ваканция (XII клас)",
+    "start": "2027-04-08",
+    "end": "2027-04-11",
+    "note": "XII grade has a shorter spring break and remains in class on 5 and 7 May"
+  },
+  "single_non_teaching_days_whole_school": [
+    {
+      "date": "2027-06-18",
+      "reason": "НВО БЕЛ - 7. и 10. клас (неучебен за всички останали ученици)"
+    },
+    {
+      "date": "2027-06-21",
+      "reason": "НВО Математика и природни науки - 7. и 10. клас (неучебен за всички останали ученици)"
+    }
+  ],
+  "single_non_teaching_days_grade_12_only": [
+    {
+      "date": "2027-05-19",
+      "reason": "ДЗИ по БЕЛ"
+    },
+    {
+      "date": "2027-05-21",
+      "reason": "Втори ДЗИ / държавен изпит за професионална квалификация"
+    }
+  ],
+  "end_of_school_year_by_grade": {
+    "I-III": "2027-06-02",
+    "IV-VI": "2027-06-16",
+    "V-VI_sportni_uchilishta": "2027-06-30",
+    "VII-XI": "2027-07-02",
+    "XII": "2027-05-13"
+  },
+  "notes": [
+    "7. klas: last teaching day is 2 July 2027, but 18 and 21 June 2027 are non-teaching (NVO exam days) even for 7th graders.",
+    "Re-check this calendar if MON issues an amending order; always verify against https://www.mon.bg before relying on it for a new school year."
+  ]
+}
