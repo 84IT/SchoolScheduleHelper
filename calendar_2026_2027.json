@@ -1,7 +1,7 @@
 {
   "school_year": "2026/2027",
-  "source": "MON (Bulgaria) official order 'Grafik na uchebnoto vreme 2026/2027', published 31.08.2026; cross-checked against az-buki.bg (MON press office), boulevardbulgaria.bg, dbr.bg, smarty-kids.bg (all week of 2026-09-01)",
-  "retrieved": "2026-09-09",
+  "source": "MON (Bulgaria) official order 'Grafik na uchebnoto vreme 2026/2027', published 31.08.2026; cross-checked against az-buki.bg (MON press office), boulevardbulgaria.bg, dbr.bg, smarty-kids.bg (all week of 2026-09-01); national holidays falling in term time (22 Sep 2026, 3 Mar 2027) added per smarty-kids.bg breakdown and standard BG Labour Code Art.154 holiday list, cross-checked 2026-09-10",
+  "retrieved": "2026-09-10",
   "start_of_school_year": "2026-09-15",
   "second_term_start": "2027-02-03",
   "vacations_all_grades_except_note": [
@@ -46,6 +46,14 @@
   },
   "single_non_teaching_days_whole_school": [
     {
+      "date": "2026-09-22",
+      "reason": "Ден на Независимостта на България (официален национален празник)"
+    },
+    {
+      "date": "2027-03-03",
+      "reason": "Национален празник на България (Освобождение)"
+    },
+    {
       "date": "2027-06-18",
       "reason": "НВО БЕЛ - 7. и 10. клас (неучебен за всички останали ученици)"
     },
@@ -73,6 +81,7 @@
   },
   "notes": [
     "7. klas: last teaching day is 2 July 2027, but 18 and 21 June 2027 are non-teaching (NVO exam days) even for 7th graders.",
+    "General national holidays (Labour Code Art.154) that fall on a weekday NOT already covered by a vacation window are added to single_non_teaching_days_whole_school: 22 Sep 2026 and 3 Mar 2027 for this school year. Other national holidays (1 May, 6 May, 24 May, 6 Sep, 1 Nov, Christmas) already fall inside a vacation window or on a weekend in 2026/2027 and need no separate entry - re-check this each year, it changes.",
     "Re-check this calendar if MON issues an amending order; always verify against https://www.mon.bg before relying on it for a new school year."
   ]
 }

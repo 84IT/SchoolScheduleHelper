@@ -1,15 +1,54 @@
 import datetime
 import json
 import os
+import sys
 import docx
 import pandas as pd
 import streamlit as st
+
+# Всички запазвани файлове (график, планове, извънредни дни, календар) се
+# пишат/четат спрямо тази папка - НЕ спрямо текущата работна директория
+# (CWD) и НЕ спрямо __file__ на самия app.py (последното е ненадеждно при
+# .exe, защото __file__ вътре в скрипт, изпълняван динамично от Streamlit,
+# не е гарантирано да сочи предвидимо място в PyInstaller бъндъла).
+#
+# Вместо това:
+# - Обикновен .py скрипт (streamlit run app.py): папката на самия app.py.
+# - PyInstaller .exe (--onedir): папката ДО самото .exe (sys.executable),
+#   а НЕ вътрешната _internal бъндъл-папка - предвидимо място, което
+#   потребителят вижда и може лесно да бекъпва/премества.
+# sys.frozen/sys.executable са процесни атрибути, зададени от PyInstaller
+# bootloader-а и валидни навсякъде в процеса, включително в код, изпълнен
+# динамично от Streamlit - за разлика от __file__, което зависи от това
+# как точно Streamlit подава скрипта за изпълнение.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _seed_bundled_file(filename):
+    """При първо стартиране на .exe копира 'фабричния' файл, пакетиран В
+    бъндъла (_MEIPASS), до самото .exe (BASE_DIR) - за да го вижда
+    потребителят там и да може да го сменя занапред (напр. нов
+    calendar_<година>.json всяка следваща учебна година). При обикновен
+    .py скрипт (не е frozen) просто връща пътя в BASE_DIR непроменен."""
+    dest = os.path.join(BASE_DIR, filename)
+    if getattr(sys, "frozen", False) and not os.path.exists(dest):
+        bundled_dir = getattr(sys, "_MEIPASS", BASE_DIR)
+        src = os.path.join(bundled_dir, filename)
+        if os.path.exists(src) and os.path.abspath(src) != os.path.abspath(dest):
+            try:
+                import shutil
+                shutil.copyfile(src, dest)
+            except Exception:
+                pass
+    return dest
 
 # --- 1. Календар на МОН (Ваканции и неучебни дни) ---
 # Зарежда се от calendar_<school_year>.json, за да може лесно да се
 # замени с актуалната заповед на МОН всяка следваща учебна година,
 # без да се пипа кодът на приложението.
-CALENDAR_FILE = "calendar_2026_2027.json"
+CALENDAR_FILE = _seed_bundled_file("calendar_2026_2027.json")
 
 def _d(s):
     return datetime.date.fromisoformat(s)
@@ -40,6 +79,28 @@ def load_calendar(path=CALENDAR_FILE):
 
 CAL = load_calendar()
 
+# --- 1б. Извънредни неучебни дни (избори и др.) ---
+# За случаи извън официалната заповед на МОН - напр. изборен ден, в който
+# училищната сграда се ползва за избирателна секция. Важат за ВСИЧКИ класове.
+CUSTOM_DAYS_FILE = os.path.join(BASE_DIR, "custom_days_off.json")
+
+def load_custom_days():
+    if os.path.exists(CUSTOM_DAYS_FILE):
+        try:
+            with open(CUSTOM_DAYS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return {_d(x["date"]): x["reason"] for x in raw}
+        except Exception:
+            return {}
+    return {}
+
+def save_custom_days(days_dict):
+    payload = [{"date": d.isoformat(), "reason": r} for d, r in sorted(days_dict.items())]
+    with open(CUSTOM_DAYS_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+CUSTOM_DAYS = load_custom_days()
+
 def end_of_year_for_grade(grade_str):
     """grade_str e.g. '7' -> връща крайната дата за съответния клас."""
     try:
@@ -57,6 +118,8 @@ def end_of_year_for_grade(grade_str):
 def is_school_day(date_obj, grade_str=None):
     if date_obj.weekday() in [5, 6]:
         return False
+    if date_obj in CUSTOM_DAYS:
+        return False
     is_12 = (str(grade_str) == "12")
     single = CAL["single_12"] if is_12 else CAL["single_all"]
     # 12th grade also observes the whole-school NVO non-teaching days
@@ -70,8 +133,8 @@ def is_school_day(date_obj, grade_str=None):
         return False
     return True
 
-CONFIG_FILE = "schedule_config.json"
-RAZPREDELENIA_DIR = "razpredelenia"
+CONFIG_FILE = os.path.join(BASE_DIR, "schedule_config.json")
+RAZPREDELENIA_DIR = os.path.join(BASE_DIR, "razpredelenia")
 
 def parse_docx_distribution(file_path_or_bytes):
     """
@@ -152,37 +215,51 @@ def load_schedule_config():
 # различава от последно запазения план и да предложи синхронизация.
 import hashlib
 
-PLANS_DIR = "lesson_plans"
+PLANS_DIR = os.path.join(BASE_DIR, "lesson_plans")
 
 def compute_topics_hash(topics):
     sig = [[t.get("seq"), t.get("topic"), t.get("vid")] for t in topics]
     raw = json.dumps(sig, ensure_ascii=False)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+def compute_calendar_signature():
+    """Отпечатък на всичко календарно, което влияе върху разпределението:
+    официалния календар (CAL) + извънредните неучебни дни (CUSTOM_DAYS).
+    Включен е в плановия подпис, така че редактиране на calendar_*.json
+    или добавяне на извънреден неучебен ден да задейства банера за
+    синхронизация в таб 'Календар', както при промяна на .docx."""
+    sig = {
+        "start": str(CAL["start"]),
+        "vacations": [[str(s), str(e), n] for s, e, n in CAL["vacations"]],
+        "vacations_12": [[str(s), str(e), n] for s, e, n in CAL["vacations_12"]],
+        "single_all": {str(k): v for k, v in CAL["single_all"].items()},
+        "single_12": {str(k): v for k, v in CAL["single_12"].items()},
+        "end_of_year": {k: str(v) for k, v in CAL["end_of_year"].items()},
+        "custom": {str(k): v for k, v in CUSTOM_DAYS.items()},
+    }
+    raw = json.dumps(sig, ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def compute_plan_signature(topics):
+    return compute_topics_hash(topics) + ":" + compute_calendar_signature()
+
 def simulate_plan(topics, cls_schedule, start_date, year_end, grade_str):
     """Разпределя урок по урок (1 урок = 1 астрономически час) по реалните
-    учебни дни на класа, като спазва ваканциите и неучебните дни."""
-    plan = []
-    cur = start_date
-    idx = 0
-    n = len(topics)
-    # горна граница за да не влезем в безкраен цикъл при празен график
-    hard_stop = year_end + datetime.timedelta(days=1)
-    while idx < n and cur <= hard_stop:
-        if is_school_day(cur, grade_str) and cur.weekday() in cls_schedule:
-            hrs = cls_schedule[cur.weekday()]
-            for _ in range(hrs):
-                if idx >= n:
-                    break
-                plan.append({**topics[idx], "date": cur})
-                idx += 1
-        cur += datetime.timedelta(days=1)
-    return plan, idx < n  # (план, overflow?)
+    учебни дни на класа, като спазва ваканциите и неучебните дни.
+    Реализирано чрез _simulate_forward (виж там overflow поведението)."""
+    return _simulate_forward(topics, start_date, cls_schedule, grade_str, year_end, hours_used_on_start_date=0)
 
 def _simulate_forward(topics_slice, start_date, cls_schedule, grade_str, year_end, hours_used_on_start_date=0):
     """Попълва дати за topics_slice, продължавайки от start_date: първо
     остатъчните свободни часове на самия start_date (ако има), после ден
-    по ден напред. Използва се и за преместване, и за синхронизация."""
+    по ден напред. Използва се за начална генерация, преместване и
+    синхронизация.
+
+    Ако всички уроци не се съберат преди year_end (overflow), НЕ ги
+    изхвърля - продължава да им търси дати отвъд края на годината на
+    класа (пак спазвайки уикенди/ваканции/извънредни неучебни дни), за да
+    остане списъкът винаги с толкова елементи, колкото топиците на входа.
+    overflow=True вече е сигналът към потребителя, че нещо не се събира."""
     result = []
     idx = 0
     n = len(topics_slice)
@@ -204,9 +281,103 @@ def _simulate_forward(topics_slice, start_date, cls_schedule, grade_str, year_en
                 result.append({**topics_slice[idx], "date": cur})
                 idx += 1
         cur += datetime.timedelta(days=1)
-    return result, idx < n  # (резултат, overflow?)
 
-def save_plan(cls, plan, topics):
+    overflow = idx < n
+    if overflow:
+        # Продължаваме без граничната дата на класа (само уикенди/
+        # ваканции/извънредни дни все още важат), за да не изчезват уроци.
+        far_stop = year_end + datetime.timedelta(days=730)
+        while idx < n and cur <= far_stop:
+            if is_school_day(cur, None) and cur.weekday() in cls_schedule:
+                for _ in range(cls_schedule[cur.weekday()]):
+                    if idx >= n:
+                        break
+                    result.append({**topics_slice[idx], "date": cur})
+                    idx += 1
+            cur += datetime.timedelta(days=1)
+
+    return result, overflow
+
+UNDO_MAX = 5  # колко последни промени пазим за отмяна (на клас)
+
+def _undo_path(cls):
+    return os.path.join(PLANS_DIR, f"{cls}.undo.json")
+
+def push_undo_snapshot(cls, action_desc):
+    """Записва ТЕКУЩОТО (преди промяната) съдържание на плана в стека за
+    отмяна, преди то да бъде презаписано от save_plan. Ако файлът все още
+    не съществува (първо генериране), няма какво да пазим - прескача се."""
+    path = os.path.join(PLANS_DIR, f"{cls}.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            current_raw = f.read()
+    except Exception:
+        return
+    upath = _undo_path(cls)
+    stack = []
+    if os.path.exists(upath):
+        try:
+            with open(upath, "r", encoding="utf-8") as f:
+                stack = json.load(f)
+        except Exception:
+            stack = []
+    stack.append({
+        "description": action_desc,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "raw": current_raw,
+    })
+    stack = stack[-UNDO_MAX:]
+    os.makedirs(PLANS_DIR, exist_ok=True)
+    with open(upath, "w", encoding="utf-8") as f:
+        json.dump(stack, f, ensure_ascii=False, indent=2)
+
+def peek_undo(cls):
+    """Връща {'description', 'timestamp'} за последната отменима промяна,
+    или None ако няма такава."""
+    upath = _undo_path(cls)
+    if not os.path.exists(upath):
+        return None
+    try:
+        with open(upath, "r", encoding="utf-8") as f:
+            stack = json.load(f)
+    except Exception:
+        return None
+    return stack[-1] if stack else None
+
+def undo_last_change(cls):
+    """Връща плана към състоянието му ТОЧНО преди последната промяна -
+    без преизчисляване, директно от записан снапшот. Затова е по-сигурно
+    от 'уплътняване': ако последното действие е било 'автопремести заради
+    нов неучебен ден' и после отмените (изтриете) същия неучебен ден,
+    отмяната връща урока обратно на оригиналната му дата на 100%, без
+    евристики. True при успех, False ако няма какво да се отменя."""
+    upath = _undo_path(cls)
+    if not os.path.exists(upath):
+        return False
+    try:
+        with open(upath, "r", encoding="utf-8") as f:
+            stack = json.load(f)
+    except Exception:
+        return False
+    if not stack:
+        return False
+    last = stack.pop()
+    path = os.path.join(PLANS_DIR, f"{cls}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(last["raw"])
+    with open(upath, "w", encoding="utf-8") as f:
+        json.dump(stack, f, ensure_ascii=False, indent=2)
+    return True
+
+def save_plan(cls, plan, topics, action_desc=None):
+    """action_desc: ако е подадено, преди записа се пази снапшот на СТАРОТО
+    съдържание в стека за отмяна (виж push_undo_snapshot) с това описание.
+    None означава 'не пази отмяна за това записване' - използва се само за
+    самото първо генериране на плана, когато няма предишно състояние."""
+    if action_desc:
+        push_undo_snapshot(cls, action_desc)
     os.makedirs(PLANS_DIR, exist_ok=True)
     path = os.path.join(PLANS_DIR, f"{cls}.json")
     serial = []
@@ -214,45 +385,119 @@ def save_plan(cls, plan, topics):
         row = {k: v for k, v in l.items() if k != "date"}
         row["date"] = l["date"].isoformat()
         serial.append(row)
-    payload = {"source_hash": compute_topics_hash(topics), "lessons": serial}
+    payload = {
+        "source_hash": compute_plan_signature(topics),
+        "topics_hash": compute_topics_hash(topics),
+        "lessons": serial,
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 def load_plan_raw(cls):
     """Чете запазения план от диска без да го сверява с текущия .docx.
-    Връща (lessons_или_None, stored_hash_или_None). stored_hash е None и
-    за файлове от по-стара версия на приложението (без записан хеш)."""
+    Връща (lessons_или_None, stored_hash_или_None, stored_topics_hash_или_None).
+    Хешовете са None за файлове от по-стара версия на приложението."""
     path = os.path.join(PLANS_DIR, f"{cls}.json")
     if not os.path.exists(path):
-        return None, None
+        return None, None, None
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
-        return None, None
+        return None, None, None
     if isinstance(raw, dict) and "lessons" in raw:
-        lessons, stored_hash = raw["lessons"], raw.get("source_hash")
+        lessons = raw["lessons"]
+        stored_hash = raw.get("source_hash")
+        stored_topics_hash = raw.get("topics_hash")
     else:
-        lessons, stored_hash = raw, None  # стар формат (v9-v14) - без хеш
+        lessons, stored_hash, stored_topics_hash = raw, None, None  # стар формат
     for r in lessons:
         r["date"] = _d(r["date"])
-    return lessons, stored_hash
+    return lessons, stored_hash, stored_topics_hash
 
-def load_or_generate_plan(cls, topics, cls_schedule, start_date, year_end, grade_str, force_regenerate=False):
+def load_or_generate_plan(cls, topics, cls_schedule, start_date, year_end, grade_str, force_regenerate=False, action_desc=None):
     """Зарежда персистирания план. Ако липсва, генерира го от .docx.
-    Ако вече съществува, но .docx междувременно се е променил (различен
-    хеш), НЕ презаписва автоматично — връща стария план с hash_mismatch=True,
-    за да може потребителят съзнателно да избере синхронизация/нулиране
-    (вижте таб 'Календар'). За да не губи ръчни редакции без предупреждение."""
+    Ако вече съществува, но .docx или календарът междувременно са се
+    променили (различен подпис), НЕ презаписва автоматично — връща стария
+    план с hash_mismatch=True, за да може потребителят съзнателно да
+    избере действие (вижте таб 'Календар'). За да не губи ръчни редакции
+    без предупреждение. action_desc се препраща на save_plan (за отмяна)
+    само при force_regenerate - обикновеното генериране при липсващ файл
+    не създава запис за отмяна (няма предишно състояние)."""
     if not force_regenerate:
-        lessons, stored_hash = load_plan_raw(cls)
+        lessons, stored_hash, _stored_topics_hash = load_plan_raw(cls)
         if lessons is not None:
-            if stored_hash == compute_topics_hash(topics):
+            if stored_hash == compute_plan_signature(topics):
                 return lessons, False, False
             return lessons, False, True
     plan, overflow = simulate_plan(topics, cls_schedule, start_date, year_end, grade_str)
-    save_plan(cls, plan, topics)
+    save_plan(cls, plan, topics, action_desc=action_desc if force_regenerate else None)
     return plan, overflow, False
+
+def find_invalid_lessons(plan, cls_schedule, grade_str):
+    """Връща уроците, чиято запазена дата вече НЕ е валиден учебен ден за
+    класа (напр. заради нов извънреден неучебен ден или редактиран
+    календар) - т.е. уроци, които сега 'висят' на несъществуващ учебен час."""
+    invalid = []
+    for l in plan:
+        d = l["date"]
+        if not (is_school_day(d, grade_str) and d.weekday() in cls_schedule):
+            invalid.append(l)
+    return invalid
+
+def _resync_from_index(plan, idx, cls_schedule, grade_str, year_end, start_date):
+    """0-базиран idx: урокът на тази позиция и всичко след него се
+    пренарежда наново от най-ранната възможна свободна дата (продължавайки
+    от датата на предходния урок, или от start_date ако idx=0), запазвайки
+    всичко ПРЕДИ idx непроменено. Споделена основа за 'избутване напред'
+    (при нов неучебен ден) и 'уплътняване назад' (при освободен ден)."""
+    if idx <= 0:
+        anchor_date = start_date
+        hours_used = 0
+    else:
+        anchor_date = plan[idx - 1]["date"]
+        hours_used = sum(1 for l in plan[:idx] if l["date"] == anchor_date)
+    remaining = plan[idx:]
+    simulated, overflow = _simulate_forward(remaining, anchor_date, cls_schedule, grade_str, year_end, hours_used)
+    return plan[:idx] + simulated, overflow
+
+def resync_from_invalid(plan, cls_schedule, grade_str, year_end, start_date):
+    """Автоматичен вариант за 'Option 1': намира ПЪРВИЯ урок с вече
+    невалидна дата и пренарежда него и всичко след него от там нататък
+    (следващия свободен учебен час за класа), без да пипа по-ранните
+    уроци. Ако урокът е бил единствен по-рано в реда с невалидна дата,
+    ефективно го 'изтласква' на следващия наличен час, а следващите
+    уроци се приплъзват след него - точно поведението поискано от
+    потребителя за 'auto shift'."""
+    first_bad_idx = None
+    for i, l in enumerate(plan):
+        d = l["date"]
+        if not (is_school_day(d, grade_str) and d.weekday() in cls_schedule):
+            first_bad_idx = i
+            break
+    if first_bad_idx is None:
+        return plan, False
+    return _resync_from_index(plan, first_bad_idx, cls_schedule, grade_str, year_end, start_date)
+
+def compact_from(plan, seq, cls_schedule, grade_str, year_end, start_date):
+    """'Уплътнява' графика от урок № seq (1-базиран) нататък: премества
+    урок seq и всичко след него на най-ранните свободни дати според
+    ТЕКУЩИЯ календар, без да пипа нищо преди seq. Обратното на 'избутване'
+    - използва се когато вече неучебен ден е бил премахнат (грешно добавен
+    извънреден ден, отменени избори и т.н.) и е останала ненужна дупка."""
+    return _resync_from_index(plan, seq - 1, cls_schedule, grade_str, year_end, start_date)
+
+def suggest_compact_anchor(plan, topics, cls_schedule, grade_str, year_end, start_date):
+    """Подсказва откъде има смисъл да се уплътни: сравнява текущия план с
+    'чиста' симулация на същите теми при ТЕКУЩИЯ календар и връща номера
+    (1-базиран) на първия урок, чиято дата се различава - т.е. първия
+    признак за ненужна дупка. None ако няма разлика (графикът вече е
+    максимално уплътнен)."""
+    fresh, _overflow = simulate_plan(topics, cls_schedule, start_date, year_end, grade_str)
+    for i in range(min(len(fresh), len(plan))):
+        if fresh[i]["date"] != plan[i]["date"]:
+            return i + 1
+    return None
 
 def sync_plan(old_plan, new_topics, cls_schedule, start_date, year_end, grade_str):
     """Синхронизира персистирания план с редактиран .docx: пази датите на
@@ -290,6 +535,8 @@ def reschedule_from(plan, seq, new_date, cls_schedule, grade_str, year_end):
     return plan[:seq] + simulated
 
 def vacation_reason(day, grade_str):
+    if day in CUSTOM_DAYS:
+        return CUSTOM_DAYS[day]
     is_12 = (str(grade_str) == "12")
     if day in CAL["single_all"]:
         return CAL["single_all"][day]
@@ -356,7 +603,7 @@ def render_month_calendar(plan_by_date, year, month, grade_str):
             content = [f"<div style='font-weight:700; font-size:15px; color:#333;'>{day.day}</div>"]
             reason = vacation_reason(day, grade_str)
             if day.weekday() >= 5 and not reason:
-                bg = "#f4f4f4"
+                bg = "#d9d9d9"
             if reason:
                 bg = VACATION_BG
                 content.append(
@@ -536,6 +783,28 @@ if all_grades:
 
 school_year_start = st.sidebar.date_input("Начало на учебната година", CAL["start"])
 
+st.sidebar.markdown("---")
+st.sidebar.header("🗳️ 3. Извънредни неучебни дни")
+st.sidebar.caption("Напр. избори, аварийно бедствено положение и др. — важат за всички класове.")
+with st.sidebar.form("add_custom_day_form", clear_on_submit=True):
+    new_custom_date = st.date_input("Дата:", key="new_custom_date")
+    new_custom_reason = st.text_input("Причина:", key="new_custom_reason", placeholder="напр. Избори за...")
+    add_custom_submitted = st.form_submit_button("➕ Добави")
+    if add_custom_submitted:
+        CUSTOM_DAYS[new_custom_date] = new_custom_reason or "Извънреден неучебен ден"
+        save_custom_days(CUSTOM_DAYS)
+        st.sidebar.success(f"Добавено: {new_custom_date.strftime('%d.%m.%Y')}")
+        st.rerun()
+
+if CUSTOM_DAYS:
+    for cd, reason in sorted(CUSTOM_DAYS.items()):
+        cdc1, cdc2 = st.sidebar.columns([4, 1])
+        cdc1.caption(f"{cd.strftime('%d.%m.%Y')} — {reason}")
+        if cdc2.button("🗑️", key=f"del_custom_{cd.isoformat()}"):
+            del CUSTOM_DAYS[cd]
+            save_custom_days(CUSTOM_DAYS)
+            st.rerun()
+
 # --- Главен екран ---
 tab1, tab2, tab_cal, tab3 = st.tabs(["📊 Седмично разписание", "📅 График за Контролни", "🗓️ Календар", "📥 Експорт"])
 
@@ -619,7 +888,7 @@ with tab2:
                             f"година ({year_end.strftime('%d.%m.%Y')}) при текущата седмична натовареност. "
                             "Проверете часовете по математика за този клас."
                         )
-                    if hash_mismatch:
+                    if hash_mismatch and not st.session_state.get(f"dismiss_mismatch_{cls}", False):
                         st.info(
                             f"ℹ️ Качен е различен .docx за {cls_grade} клас спрямо последно запазения "
                             f"график на {cls} — датите по-долу може да не отразяват последните промени. "
@@ -741,40 +1010,117 @@ with tab_cal:
                     level, msg = st.session_state.pop(flash_key)
                     getattr(st, level)(msg)
 
+                last_undo = peek_undo(cal_cls)
+                if last_undo:
+                    undo_col1, undo_col2 = st.columns([4, 1])
+                    with undo_col1:
+                        ts_display = last_undo["timestamp"].replace("T", " ")
+                        st.caption(f"↩️ Последна промяна: {last_undo['description']} ({ts_display})")
+                    with undo_col2:
+                        if st.button("↩️ Отмени", key=f"undo_{cal_cls}", width='stretch',
+                                     help="Връща плана ТОЧНО към състоянието му преди последната промяна — "
+                                          "без преизчисляване, директно от запазено копие."):
+                            if undo_last_change(cal_cls):
+                                st.session_state[flash_key] = (
+                                    "success", f"Отменено: {last_undo['description']}."
+                                )
+                                st.rerun()
+
                 dismiss_key = f"dismiss_mismatch_{cal_cls}"
                 if hash_mismatch and not st.session_state.get(dismiss_key, False):
-                    st.warning(
-                        f"⚠️ Качен е нов или редактиран .docx за {cal_grade} клас, различен от "
-                        f"последно запазения график за {cal_cls}. Какво да направя?"
-                    )
-                    mcol1, mcol2, mcol3 = st.columns(3)
-                    with mcol1:
-                        if st.button(
-                            "🔄 Синхронизирай", key=f"syncbtn_{cal_cls}", width='stretch',
-                            help="Запазва датите на уроците, които не са се променили, и преразпределя "
-                                 "само промените/новите уроци напред от там."
-                        ):
-                            new_plan, _ov = sync_plan(plan, topics, cls_schedule, school_year_start, year_end, cal_grade)
-                            save_plan(cal_cls, new_plan, topics)
-                            st.session_state.pop(dismiss_key, None)
-                            st.session_state[flash_key] = ("success", f"Графикът за {cal_cls} е синхронизиран с новия .docx.")
-                            st.rerun()
-                    with mcol2:
-                        if st.button(
-                            "♻️ Нулирай по .docx", key=f"resetbtn_top_{cal_cls}", width='stretch',
-                            help="Изтрива всички ръчни промени и генерира графика наново от началото на годината."
-                        ):
-                            new_plan, _ov, _hm = load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade, force_regenerate=True)
-                            st.session_state.pop(dismiss_key, None)
-                            st.session_state[flash_key] = ("success", f"Графикът за {cal_cls} е нулиран по текущия .docx.")
-                            st.rerun()
-                    with mcol3:
-                        if st.button(
-                            "➡️ Продължи със стария", key=f"dismissbtn_{cal_cls}", width='stretch',
-                            help="Игнорирай промените в .docx за момента (ще напомня пак при следващо отваряне)."
-                        ):
-                            st.session_state[dismiss_key] = True
-                            st.rerun()
+                    _raw_lessons, _stored_hash, stored_topics_hash = load_plan_raw(cal_cls)
+                    docx_changed = stored_topics_hash is None or stored_topics_hash != compute_topics_hash(topics)
+                    invalid_lessons = find_invalid_lessons(plan, cls_schedule, cal_grade)
+                    compact_anchor = None
+                    if not invalid_lessons:
+                        compact_anchor = suggest_compact_anchor(plan, topics, cls_schedule, cal_grade, year_end, school_year_start)
+
+                    msg_parts = [f"⚠️ Нещо се е променило спрямо последно запазения график за {cal_cls}."]
+                    if invalid_lessons:
+                        names = ", ".join(
+                            f"№{l['seq']} ({l['date'].strftime('%d.%m.%Y')})" for l in invalid_lessons[:6]
+                        )
+                        extra = "" if len(invalid_lessons) <= 6 else f" и още {len(invalid_lessons) - 6}"
+                        msg_parts.append(f"📅 {len(invalid_lessons)} урок(а) вече падат в неучебен ден: {names}{extra}.")
+                    if compact_anchor is not None:
+                        msg_parts.append(
+                            f"🗜️ Освободило се е място (напр. премахнат неучебен ден) - от урок №{compact_anchor} "
+                            "нататък графикът може да се уплътни."
+                        )
+                    if docx_changed:
+                        msg_parts.append("📄 Качен е нов/редактиран .docx за този випуск.")
+                    st.warning("  \n".join(msg_parts))
+
+                    actions = []
+                    if invalid_lessons:
+                        actions.append((
+                            "auto", "🔄 Автопремести засегнатите",
+                            "Премества засегнатите уроци на следващия свободен учебен час за класа "
+                            "и приплъзва всичко след тях с толкова дни, колкото трябва."
+                        ))
+                        actions.append((
+                            "manual", "✋ Аз ще ги преместя ръчно",
+                            "Нищо не се променя автоматично - използвайте 'Преместване на урок' или "
+                            "'Размяна' по-долу за изброените урок(ци) (напр. за да съберете 2 урока в "
+                            "1 учебен час и да наваксате)."
+                        ))
+                    if compact_anchor is not None:
+                        actions.append((
+                            "compact", "🗜️ Уплътни освободеното място",
+                            f"Премества урок №{compact_anchor} и всичко след него на най-ранните свободни "
+                            "часове според текущия календар - връща разписанието към нормалния му темп."
+                        ))
+                    if docx_changed:
+                        actions.append((
+                            "sync", "🔄 Синхронизирай с .docx",
+                            "Запазва датите на уроците, които не са се променили, и преразпределя само "
+                            "промените/новите уроци напред от там."
+                        ))
+                    actions.append((
+                        "reset", "♻️ Нулирай по .docx",
+                        "Изтрива всички ръчни промени и генерира графика наново от началото на годината."
+                    ))
+                    actions.append((
+                        "dismiss", "➡️ Продължи както си е",
+                        "Не прави нищо сега (ще напомня пак при следващо отваряне)."
+                    ))
+
+                    mcols = st.columns(len(actions))
+                    for col, (action_id, label, help_txt) in zip(mcols, actions):
+                        with col:
+                            if st.button(label, key=f"{action_id}_{cal_cls}", width='stretch', help=help_txt):
+                                if action_id == "auto":
+                                    new_plan, _ov = resync_from_invalid(plan, cls_schedule, cal_grade, year_end, school_year_start)
+                                    save_plan(cal_cls, new_plan, topics, action_desc="Автопремести засегнатите уроци")
+                                    st.session_state.pop(dismiss_key, None)
+                                    st.session_state[flash_key] = (
+                                        "success", f"Засегнатите уроци за {cal_cls} са преместени автоматично."
+                                    )
+                                elif action_id == "manual":
+                                    st.session_state[dismiss_key] = True
+                                elif action_id == "compact":
+                                    new_plan, _ov = compact_from(plan, compact_anchor, cls_schedule, cal_grade, year_end, school_year_start)
+                                    save_plan(cal_cls, new_plan, topics, action_desc=f"Уплътни от урок №{compact_anchor}")
+                                    st.session_state.pop(dismiss_key, None)
+                                    st.session_state[flash_key] = (
+                                        "success", f"Графикът за {cal_cls} е уплътнен от урок №{compact_anchor} нататък."
+                                    )
+                                elif action_id == "sync":
+                                    new_plan, _ov = sync_plan(plan, topics, cls_schedule, school_year_start, year_end, cal_grade)
+                                    save_plan(cal_cls, new_plan, topics, action_desc="Синхронизирай с нов .docx")
+                                    st.session_state.pop(dismiss_key, None)
+                                    st.session_state[flash_key] = (
+                                        "success", f"Графикът за {cal_cls} е синхронизиран с новия .docx."
+                                    )
+                                elif action_id == "reset":
+                                    load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade, force_regenerate=True, action_desc="Нулиране по .docx")
+                                    st.session_state.pop(dismiss_key, None)
+                                    st.session_state[flash_key] = (
+                                        "success", f"Графикът за {cal_cls} е нулиран по текущия .docx."
+                                    )
+                                elif action_id == "dismiss":
+                                    st.session_state[dismiss_key] = True
+                                st.rerun()
                     st.markdown("---")
 
                 if overflow:
@@ -862,14 +1208,14 @@ with tab_cal:
                 if st.button("↪️ Приложи преместването", key=f"shiftbtn_{cal_cls}", disabled=not (slot_ok or override)):
                     if auto_adjust:
                         new_plan = reschedule_from(plan, shift_seq, new_shift_date, cls_schedule, cal_grade, year_end)
-                        save_plan(cal_cls, new_plan, topics)
+                        save_plan(cal_cls, new_plan, topics, action_desc=f"Премести урок №{shift_seq} (с пренареждане)")
                         st.session_state[f"flash_{cal_cls}"] = (
                             "success", f"Графикът за {cal_cls} е пренареден от урок №{shift_seq} нататък."
                         )
                     else:
                         new_plan = [dict(l) for l in plan]
                         new_plan[shift_seq - 1]["date"] = new_shift_date
-                        save_plan(cal_cls, new_plan, topics)
+                        save_plan(cal_cls, new_plan, topics, action_desc=f"Премести урок №{shift_seq} (без пренареждане)")
                         same_day_count = sum(1 for l in new_plan if l["date"] == new_shift_date)
                         capacity = cls_schedule.get(new_shift_date.weekday(), 0)
                         if same_day_count > capacity:
@@ -887,6 +1233,60 @@ with tab_cal:
                                 "Останалите уроци не бяха пренаредени."
                             )
                     st.rerun()
+
+                st.markdown("---")
+                st.subheader("🗜️ Уплътни графика (при отменен/грешно добавен неучебен ден)")
+                st.caption(
+                    "Ако премахнете (или изтриете) неучебен ден и вече не е нужен, тук може да "
+                    "приберете освободеното място назад, вместо целият график да остане изместен. "
+                    "Избраният урок и всичко след него се пренарежда на най-ранните свободни часове "
+                    "според текущия календар — уроците ПРЕДИ него не се пипат."
+                )
+                suggested_anchor = suggest_compact_anchor(plan, topics, cls_schedule, cal_grade, year_end, school_year_start)
+                if suggested_anchor is None:
+                    st.caption("✅ Графикът вече е максимално уплътнен спрямо текущия календар.")
+                else:
+                    st.caption(f"💡 Предложение: изглежда има ненужна разлика от урок №{suggested_anchor} нататък.")
+                    default_idx = min(suggested_anchor - 1, len(seq_options) - 1)
+                    compact_choice = st.selectbox(
+                        "Уплътни от урок:", options=seq_options, key=f"compact_{cal_cls}", index=default_idx
+                    )
+                    compact_seq = int(compact_choice.split("—")[0].replace("№", "").strip())
+                    if st.button("🗜️ Уплътни от тук нататък", key=f"compactbtn_{cal_cls}"):
+                        new_plan, ov = compact_from(plan, compact_seq, cls_schedule, cal_grade, year_end, school_year_start)
+                        save_plan(cal_cls, new_plan, topics, action_desc=f"Уплътни от урок №{compact_seq}")
+                        st.session_state[f"flash_{cal_cls}"] = (
+                            "success", f"Графикът за {cal_cls} е уплътнен от урок №{compact_seq} нататък."
+                        )
+                        st.rerun()
+
+                st.markdown("---")
+                st.subheader("🔀 Размяна на два урока (напр. отложи тест)")
+                st.caption(
+                    "Разменя само датите на два избрани урока — идеално за 'да разменя тест с обикновен "
+                    "урок', без да местите нищо друго."
+                )
+                swp_col1, swp_col2 = st.columns(2)
+                with swp_col1:
+                    swap_a_choice = st.selectbox("Урок А:", options=seq_options, key=f"swapA_{cal_cls}")
+                    swap_a_seq = int(swap_a_choice.split("—")[0].replace("№", "").strip())
+                with swp_col2:
+                    swap_b_choice = st.selectbox("Урок Б:", options=seq_options, key=f"swapB_{cal_cls}", index=min(1, len(seq_options) - 1))
+                    swap_b_seq = int(swap_b_choice.split("—")[0].replace("№", "").strip())
+
+                if swap_a_seq == swap_b_seq:
+                    st.caption("Изберете два различни урока.")
+                elif st.button("🔀 Размени датите", key=f"swapbtn_{cal_cls}"):
+                    new_plan = [dict(l) for l in plan]
+                    ia, ib = swap_a_seq - 1, swap_b_seq - 1
+                    new_plan[ia]["date"], new_plan[ib]["date"] = new_plan[ib]["date"], new_plan[ia]["date"]
+                    save_plan(cal_cls, new_plan, topics, action_desc=f"Размяна на урок №{swap_a_seq} и №{swap_b_seq}")
+                    st.session_state[f"flash_{cal_cls}"] = (
+                        "success",
+                        f"Разменени дати: урок №{swap_a_seq} ↔ урок №{swap_b_seq}."
+                    )
+                    st.rerun()
+
 
                 with st.expander("📋 Пълен списък с уроци (редактирайте дата на конкретен ред)"):
                     df_plan = pd.DataFrame([{
@@ -912,12 +1312,12 @@ with tab_cal:
                         new_plan = [dict(l) for l in plan]
                         for i, row in edited.iterrows():
                             new_plan[i]["date"] = row["Дата"] if isinstance(row["Дата"], datetime.date) else _d(str(row["Дата"]))
-                        save_plan(cal_cls, new_plan, topics)
+                        save_plan(cal_cls, new_plan, topics, action_desc="Ръчна промяна в таблицата")
                         st.session_state[f"flash_{cal_cls}"] = ("success", "Запазено!")
                         st.rerun()
 
                 if st.button("♻️ Нулирай към стойностите от .docx (изтрива всички ръчни промени за този клас)", key=f"reset_{cal_cls}"):
-                    new_plan, _ov, _hm = load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade, force_regenerate=True)
+                    new_plan, _ov, _hm = load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade, force_regenerate=True, action_desc="Нулиране по .docx")
                     st.session_state[f"flash_{cal_cls}"] = (
                         "success", f"Графикът за {cal_cls} е нулиран по текущия .docx."
                     )
