@@ -135,8 +135,17 @@ def is_school_day(date_obj, grade_str=None):
 
 CONFIG_FILE = os.path.join(BASE_DIR, "schedule_config.json")
 RAZPREDELENIA_DIR = os.path.join(BASE_DIR, "razpredelenia")
+DEFAULT_SUBJECT = "MAT"
 
-def parse_docx_distribution(file_path_or_bytes):
+def normalize_subject(value):
+    value = str(value or DEFAULT_SUBJECT).strip().upper()
+    return value or DEFAULT_SUBJECT
+
+def lesson_seq_from_label(label):
+    number_part = label.split("—", 1)[0].replace("№", "").split("[", 1)[0].strip()
+    return int(number_part)
+
+def parse_docx_distribution(file_path_or_bytes, subject=DEFAULT_SUBJECT):
     """
     Поддържа официалния формат на годишно тематично разпределение на МОН:
     таблица с колони № на урок | № на седмица | Тема | Вид на урочната
@@ -150,8 +159,31 @@ def parse_docx_distribution(file_path_or_bytes):
     except Exception:
         return []
 
+    subject = normalize_subject(subject)
     topics = []
     for table in doc.tables:
+        # ИУЧ files use a six-column table without MON lesson-type labels:
+        # № по ред | Учебна седмица | Тема | Очакван резултат | ...
+        if len(table.columns) >= 6 and len(table.rows) > 2:
+            header = [cell.text.strip().lower() for cell in table.rows[1].cells]
+            if "№ по ред" in header and any("тема" in cell for cell in header):
+                for row in table.rows[2:]:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if len(cells) < 4 or not cells[0].isdigit():
+                        continue
+                    topics.append({
+                        "seq": int(cells[0]),
+                        "topic": cells[2],
+                        "hours": 1,
+                        "vid": "Нови знания",
+                        "theme": "",
+                        "expected_result": cells[3],
+                        "is_exam": False,
+                        "subject": subject,
+                    })
+                if topics:
+                    return topics
+
         if len(table.columns) < 4:
             continue  # не е основната таблица с разпределението
         current_theme = ""
@@ -175,6 +207,7 @@ def parse_docx_distribution(file_path_or_bytes):
                     "vid": vid,
                     "theme": current_theme,
                     "is_exam": "онтрол" in vid,
+                    "subject": subject,
                 })
         if found_any:
             return topics  # взимаме първата разпознаваема голяма таблица
@@ -188,7 +221,7 @@ def parse_docx_distribution(file_path_or_bytes):
                 try:
                     hours = int(cells[1])
                     seq += 1
-                    topics.append({"seq": seq, "topic": cells[0], "hours": hours, "vid": "", "theme": "", "is_exam": True})
+                    topics.append({"seq": seq, "topic": cells[0], "hours": hours, "vid": "", "theme": "", "is_exam": True, "subject": subject})
                 except ValueError:
                     continue
     return topics
@@ -216,9 +249,10 @@ def load_schedule_config():
 import hashlib
 
 PLANS_DIR = os.path.join(BASE_DIR, "lesson_plans")
+PLANNING_START_DATE = None
 
 def compute_topics_hash(topics):
-    sig = [[t.get("seq"), t.get("topic"), t.get("vid")] for t in topics]
+    sig = [[t.get("seq"), t.get("topic"), t.get("vid"), normalize_subject(t.get("subject")), t.get("_schedule_signature")] for t in topics]
     raw = json.dumps(sig, ensure_ascii=False)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -236,6 +270,7 @@ def compute_calendar_signature():
         "single_12": {str(k): v for k, v in CAL["single_12"].items()},
         "end_of_year": {k: str(v) for k, v in CAL["end_of_year"].items()},
         "custom": {str(k): v for k, v in CUSTOM_DAYS.items()},
+        "planning_start": str(PLANNING_START_DATE or CAL["start"]),
     }
     raw = json.dumps(sig, ensure_ascii=False, sort_keys=True)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -261,39 +296,43 @@ def _simulate_forward(topics_slice, start_date, cls_schedule, grade_str, year_en
     остане списъкът винаги с толкова елементи, колкото топиците на входа.
     overflow=True вече е сигналът към потребителя, че нещо не се събира."""
     result = []
-    idx = 0
-    n = len(topics_slice)
+    remaining_topics = list(topics_slice)
+
+    def add_slots(date_obj, subjects):
+        for subject in subjects:
+            if not remaining_topics:
+                break
+            selected_index = next(
+                (i for i, topic in enumerate(remaining_topics)
+                 if subject is None or normalize_subject(topic.get("subject")) == subject),
+                None,
+            )
+            if selected_index is None:
+                continue
+            result.append({**remaining_topics.pop(selected_index), "date": date_obj})
+
+    def subjects_for_weekday(weekday):
+        subjects = cls_schedule.get("_subjects", {}).get(weekday)
+        return subjects if subjects is not None else [None] * cls_schedule[weekday]
+
     cur = start_date
     if is_school_day(cur, grade_str) and cur.weekday() in cls_schedule:
-        free_today = max(0, cls_schedule[cur.weekday()] - hours_used_on_start_date)
-        for _ in range(free_today):
-            if idx >= n:
-                break
-            result.append({**topics_slice[idx], "date": cur})
-            idx += 1
+        add_slots(cur, subjects_for_weekday(cur.weekday())[hours_used_on_start_date:])
     cur += datetime.timedelta(days=1)
     hard_stop = year_end + datetime.timedelta(days=60)
-    while idx < n and cur <= hard_stop:
+    while remaining_topics and cur <= hard_stop:
         if is_school_day(cur, grade_str) and cur.weekday() in cls_schedule:
-            for _ in range(cls_schedule[cur.weekday()]):
-                if idx >= n:
-                    break
-                result.append({**topics_slice[idx], "date": cur})
-                idx += 1
+            add_slots(cur, subjects_for_weekday(cur.weekday()))
         cur += datetime.timedelta(days=1)
 
-    overflow = idx < n
+    overflow = bool(remaining_topics)
     if overflow:
         # Продължаваме без граничната дата на класа (само уикенди/
         # ваканции/извънредни дни все още важат), за да не изчезват уроци.
         far_stop = year_end + datetime.timedelta(days=730)
-        while idx < n and cur <= far_stop:
+        while remaining_topics and cur <= far_stop:
             if is_school_day(cur, None) and cur.weekday() in cls_schedule:
-                for _ in range(cls_schedule[cur.weekday()]):
-                    if idx >= n:
-                        break
-                    result.append({**topics_slice[idx], "date": cur})
-                    idx += 1
+                add_slots(cur, subjects_for_weekday(cur.weekday()))
             cur += datetime.timedelta(days=1)
 
     return result, overflow
@@ -506,7 +545,9 @@ def sync_plan(old_plan, new_topics, cls_schedule, start_date, year_end, grade_st
     датата на последния запазен урок."""
     divergence = 0
     for i in range(min(len(old_plan), len(new_topics))):
-        if old_plan[i]["topic"] == new_topics[i]["topic"] and old_plan[i]["vid"] == new_topics[i]["vid"]:
+        if (old_plan[i]["topic"] == new_topics[i]["topic"]
+            and old_plan[i]["vid"] == new_topics[i]["vid"]
+            and normalize_subject(old_plan[i].get("subject")) == normalize_subject(new_topics[i].get("subject"))):
             divergence = i + 1
         else:
             break
@@ -613,15 +654,16 @@ def render_month_calendar(plan_by_date, year, month, grade_str):
                 lessons = plan_by_date.get(day, [])
                 for l in lessons:
                     label = _html.escape(l["topic"][:36])
+                    subject = _html.escape(normalize_subject(l.get("subject")))
                     emoji, color = vid_badge(l.get("vid", ""))
                     if l.get("is_exam"):
                         bg = EXAM_BG
                         content.append(
-                            f"<div style='color:{color}; font-weight:700; font-size:13px; margin-top:2px;'>{emoji} {label}</div>"
+                            f"<div style='color:{color}; font-weight:700; font-size:13px; margin-top:2px;'>{subject} {emoji} {label}</div>"
                         )
                     else:
                         content.append(
-                            f"<div style='color:#333; font-size:13px; margin-top:2px;'>{emoji} {label}</div>"
+                            f"<div style='color:#333; font-size:13px; margin-top:2px;'>{subject} {emoji} {label}</div>"
                         )
             rows.append(f"<td style='{base_style} background:{bg};'>{''.join(content)}</td>")
         rows.append("</tr>")
@@ -641,7 +683,7 @@ def build_xlsx_bytes(df, cal_source=""):
     ws = wb.active
     ws.title = "График контролни"
 
-    cols = [c for c in ["Клас", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in df.columns]
+    cols = [c for c in ["Клас", "Предмет", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in df.columns]
     ws.append(cols)
 
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -690,7 +732,7 @@ def build_xlsx_bytes(df, cal_source=""):
                 cell.alignment = Alignment(horizontal="center")
         row_i += 1
 
-    widths = {"Клас": 7, "Раздел": 30, "Раздел / Тема": 42, "Основна дата": 14, "Ден": 10, "Резервна дата": 14}
+    widths = {"Клас": 7, "Предмет": 10, "Раздел": 30, "Раздел / Тема": 42, "Основна дата": 14, "Ден": 10, "Резервна дата": 14}
     for i, c in enumerate(cols, start=1):
         ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 16)
     ws.freeze_panes = "A2"
@@ -716,6 +758,67 @@ if "weekly_schedule" not in st.session_state:
 
 if "grade_files" not in st.session_state:
     st.session_state.grade_files = {} # {"7": topics, "8": topics}
+if "grade_distributions" not in st.session_state:
+    st.session_state.grade_distributions = {}
+
+def combined_topics_for_grade(grade):
+    distributions = st.session_state.grade_distributions.get(str(grade), {})
+    if distributions:
+        combined = []
+        for subject in sorted(distributions):
+            combined.extend(distributions[subject])
+        return combined
+    return [dict(topic, subject=normalize_subject(topic.get("subject")))
+            for topic in st.session_state.grade_files.get(str(grade), [])]
+
+def schedule_entry_subject(item):
+    return normalize_subject(item.get("subject"))
+
+def class_schedule_for(cls):
+    day_map = {"Понеделник": 0, "Вторник": 1, "Сряда": 2, "Четвъртък": 3, "Петък": 4}
+    schedule = {}
+    subject_slots = {}
+    for day, items in st.session_state.weekly_schedule.items():
+        for item in items:
+            if item["class"] == cls:
+                weekday = day_map[day]
+                hours = int(item["hours"])
+                schedule[weekday] = schedule.get(weekday, 0) + hours
+                subject_slots.setdefault(weekday, []).extend([schedule_entry_subject(item)] * hours)
+    schedule["_subjects"] = subject_slots
+    return schedule
+
+def topics_for_class(cls, grade):
+    distributions = st.session_state.grade_distributions.get(str(grade), {})
+    schedule_signature = json.dumps(
+        sorted([
+            [day, int(item.get("hours", 0)), schedule_entry_subject(item)]
+            for day, items in st.session_state.weekly_schedule.items()
+            for item in items if item["class"] == cls
+        ]), ensure_ascii=False,
+    )
+    if not distributions:
+        return [dict(topic, _schedule_signature=schedule_signature)
+                for topic in combined_topics_for_grade(grade)]
+
+    subject_hours = {}
+    for day_items in st.session_state.weekly_schedule.values():
+        for item in day_items:
+            if item["class"] == cls:
+                subject = schedule_entry_subject(item)
+                subject_hours[subject] = subject_hours.get(subject, 0) + int(item["hours"])
+
+    queues = {subject: list(topics) for subject, topics in distributions.items()}
+    subjects = sorted(queues, key=lambda subject: (-subject_hours.get(subject, 0), subject))
+    weighted_order = [subject for subject in subjects for _ in range(max(1, subject_hours.get(subject, 0)))]
+    combined = []
+    while any(queues.values()):
+        for subject in weighted_order or subjects:
+            if queues.get(subject):
+                combined.append(queues[subject].pop(0))
+
+    return [dict(topic, seq=index, _schedule_signature=schedule_signature)
+            for index, topic in enumerate(combined, start=1)]
 
 # Автоматично зареждане на файлове от папката razpredelenia по випуск
 if not os.path.exists(RAZPREDELENIA_DIR):
@@ -723,12 +826,20 @@ if not os.path.exists(RAZPREDELENIA_DIR):
 
 for f_name in os.listdir(RAZPREDELENIA_DIR):
     if f_name.endswith(".docx"):
-        # Очаква име на файл от рода на '7.docx' или '7_klas.docx'
-        grade_key = f_name.split(".")[0].replace("_klas", "").strip()
+        # Поддържа старото '7.docx' и новото '7_MAT.docx'/'7_ИУЧ.docx'.
+        file_stem = f_name.rsplit(".", 1)[0]
+        file_parts = file_stem.split("_")
+        grade_key = file_parts[0].replace("klas", "").strip()
+        subject_key = normalize_subject(
+            file_parts[1] if len(file_parts) > 1 and file_parts[1].lower() != "klas" else DEFAULT_SUBJECT
+        )
         f_path = os.path.join(RAZPREDELENIA_DIR, f_name)
-        parsed = parse_docx_distribution(f_path)
+        parsed = parse_docx_distribution(f_path, subject_key)
         if parsed:
-            st.session_state.grade_files[grade_key] = parsed
+            st.session_state.grade_distributions.setdefault(grade_key, {})[subject_key] = parsed
+
+for grade_key in list(st.session_state.grade_distributions):
+    st.session_state.grade_files[grade_key] = combined_topics_for_grade(grade_key)
 
 st.title("📐 Генератор на график за Контролни работи по Математика")
 
@@ -743,6 +854,7 @@ with col_l:
     s_letter = st.selectbox("Паралелка", options=["А", "Б", "В", "Г", "Д", "Е", "Ж", "З"], index=0, key="sl")
 with col_h:
     s_hours = st.number_input("Часове", min_value=1, max_value=4, value=1, key="sh")
+st.sidebar.text_input("Кратко име на предмета", value=DEFAULT_SUBJECT, max_chars=8, key="schedule_subject")
 
 cls_name = f"{s_grade}.{s_letter}"
 
@@ -750,9 +862,13 @@ col_b1, col_b2 = st.sidebar.columns(2)
 with col_b1:
     if st.button(f"➕ Добави", width='stretch'):
         st.session_state.weekly_schedule[selected_day] = [
-            item for item in st.session_state.weekly_schedule[selected_day] if item["class"] != cls_name
+            item for item in st.session_state.weekly_schedule[selected_day]
+            if not (item["class"] == cls_name and schedule_entry_subject(item) == normalize_subject(st.session_state.schedule_subject))
         ]
-        st.session_state.weekly_schedule[selected_day].append({"class": cls_name, "hours": s_hours, "grade": s_grade})
+        st.session_state.weekly_schedule[selected_day].append({
+            "class": cls_name, "hours": s_hours, "grade": s_grade,
+            "subject": normalize_subject(st.session_state.schedule_subject),
+        })
         save_schedule_config(st.session_state.weekly_schedule)
         st.success(f"Запазено!")
 
@@ -770,18 +886,31 @@ all_grades = sorted(list({item.get("grade", item["class"].split(".")[0]) for day
 
 if all_grades:
     target_grade = st.sidebar.selectbox("Качи 1 разпределение за ЦЕЛИЯ випуск:", options=all_grades)
+    upload_subject = st.sidebar.text_input(
+        "Кратко име на предмета", value=DEFAULT_SUBJECT, max_chars=8,
+        key=f"upload_subject_{target_grade}", placeholder="напр. MAT или ИУЧ"
+    )
+    upload_subject = normalize_subject(upload_subject)
     uploaded_f = st.sidebar.file_uploader(f"Файл за {target_grade} клас", type=["docx"], key=f"file_{target_grade}")
     
     if uploaded_f:
-        parsed_topics = parse_docx_distribution(uploaded_f)
+        parsed_topics = parse_docx_distribution(uploaded_f, upload_subject)
         if parsed_topics:
-            st.session_state.grade_files[target_grade] = parsed_topics
-            file_save_name = f"{target_grade}.docx"
+            st.session_state.grade_distributions.setdefault(target_grade, {})[upload_subject] = parsed_topics
+            st.session_state.grade_files[target_grade] = combined_topics_for_grade(target_grade)
+            file_save_name = f"{target_grade}_{upload_subject}.docx"
             with open(os.path.join(RAZPREDELENIA_DIR, file_save_name), "wb") as f:
                 f.write(uploaded_f.getbuffer())
-            st.sidebar.success(f"Запазено за цял {target_grade} клас!")
+            st.sidebar.success(f"Запазено за {target_grade} клас, предмет {upload_subject}!")
 
-school_year_start = st.sidebar.date_input("Начало на учебната година", CAL["start"])
+if "planning_start_date" not in st.session_state:
+    st.session_state.planning_start_date = CAL["start"] + datetime.timedelta(days=1)
+school_year_start = st.sidebar.date_input(
+    "Първа дата с учебни часове",
+    key="planning_start_date",
+    help="15 септември остава официално начало на учебната година. По подразбиране часовете започват от 16 септември.",
+)
+PLANNING_START_DATE = school_year_start
 
 st.sidebar.markdown("---")
 st.sidebar.header("🗳️ 3. Извънредни неучебни дни")
@@ -819,7 +948,7 @@ with tab1:
             entries = st.session_state.weekly_schedule[day]
             if entries:
                 for e in entries:
-                    st.info(f"🏫 **{e['class']}** — {e['hours']} ч.")
+                    st.info(f"🏫 **{e['class']}** — {e['hours']} ч. ({schedule_entry_subject(e)})")
             else:
                 st.caption("Няма часове")
 
@@ -847,13 +976,9 @@ with tab2:
 
             for cls in all_classes:
                 cls_grade = cls.split(".")[0]
-                cls_schedule = {}
-                for day, items in st.session_state.weekly_schedule.items():
-                    for item in items:
-                        if item["class"] == cls:
-                            cls_schedule[day_map[day]] = item["hours"]
+                cls_schedule = class_schedule_for(cls)
 
-                topics = st.session_state.grade_files[cls_grade]
+                topics = topics_for_class(cls, cls_grade)
                 year_end = end_of_year_for_grade(cls_grade)
                 is_new_format = bool(topics) and bool(topics[0].get("vid"))
 
@@ -875,6 +1000,7 @@ with tab2:
                                 break
                         results.append({
                             "Клас": cls,
+                            "Предмет": normalize_subject(l.get("subject")),
                             "Раздел": l.get("theme", ""),
                             "Раздел / Тема": l["topic"],
                             "Основна дата": exam_date.strftime("%d.%m.%Y"),
@@ -930,6 +1056,7 @@ with tab2:
 
                     results.append({
                         "Клас": cls,
+                        "Предмет": normalize_subject(t.get("subject")),
                         "Раздел": t.get("theme", ""),
                         "Раздел / Тема": t["topic"],
                         "Основна дата": exam_date.strftime("%d.%m.%Y"),
@@ -946,7 +1073,15 @@ with tab2:
                         "Проверете часовете по математика за този клас."
                     )
 
-            df_res = pd.DataFrame(results).sort_values(by=["raw_date", "Клас"])
+            result_columns = [
+                "Клас", "Предмет", "Раздел", "Раздел / Тема",
+                "Основна дата", "Ден", "Резервна дата", "raw_date",
+            ]
+            df_res = pd.DataFrame(results, columns=result_columns)
+            if not df_res.empty:
+                df_res = df_res.sort_values(by=["raw_date", "Клас"])
+            else:
+                st.info("Няма намерени контролни уроци за текущите разпределения.")
 
             st.subheader("🔍 Филтрирай изгледа")
             col_f1, col_f2 = st.columns(2)
@@ -967,7 +1102,7 @@ with tab2:
                 )
                 filtered_df = filtered_df[mask | (filtered_df["Раздел"] != "")]
 
-            display_cols = [c for c in ["Клас", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in filtered_df.columns]
+            display_cols = [c for c in ["Клас", "Предмет", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in filtered_df.columns]
             st.dataframe(
                 filtered_df[display_cols],
                 width='stretch',
@@ -986,7 +1121,7 @@ with tab_cal:
         if cal_grade not in st.session_state.grade_files:
             st.warning(f"⚠️ Липсва `.docx` разпределение за {cal_grade} клас. Качете го от менюто вляво.")
         else:
-            topics = st.session_state.grade_files[cal_grade]
+            topics = topics_for_class(cal_cls, cal_grade)
             if not topics or not topics[0].get("vid"):
                 st.info(
                     "Календарният изглед работи само с новия формат на годишно "
@@ -996,11 +1131,7 @@ with tab_cal:
                 )
             else:
                 day_map = {"Понеделник": 0, "Вторник": 1, "Сряда": 2, "Четвъртък": 3, "Петък": 4}
-                cls_schedule = {}
-                for day, items in st.session_state.weekly_schedule.items():
-                    for item in items:
-                        if item["class"] == cal_cls:
-                            cls_schedule[day_map[day]] = item["hours"]
+                cls_schedule = class_schedule_for(cal_cls)
 
                 year_end = end_of_year_for_grade(cal_grade)
                 plan, overflow, hash_mismatch = load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade)
@@ -1048,7 +1179,12 @@ with tab_cal:
                             "нататък графикът може да се уплътни."
                         )
                     if docx_changed:
-                        msg_parts.append("📄 Качен е нов/редактиран .docx за този випуск.")
+                        changed_subjects = sorted({normalize_subject(t.get("subject")) for t in topics})
+                        subject_text = ", ".join(changed_subjects) or DEFAULT_SUBJECT
+                        msg_parts.append(
+                            f"📄 Променено е разпределение за випуск {cal_grade} ({subject_text}). "
+                            "Синхронизирането ще използва всички избрани предмети."
+                        )
                     st.warning("  \n".join(msg_parts))
 
                     actions = []
@@ -1169,9 +1305,9 @@ with tab_cal:
 
                 col_e1, col_e2 = st.columns([2, 1])
                 with col_e1:
-                    seq_options = [f"№{l['seq']} — {l['topic'][:45]}" for l in plan]
+                    seq_options = [f"№{l['seq']} [{normalize_subject(l.get('subject'))}] — {l['topic'][:45]}" for l in plan]
                     shift_choice = st.selectbox("Урок за преместване:", options=seq_options, key=f"shiftchoice_{cal_cls}")
-                    shift_seq = int(shift_choice.split("—")[0].replace("№", "").strip())
+                    shift_seq = lesson_seq_from_label(shift_choice)
                 with col_e2:
                     default_shift_date = plan[shift_seq - 1]["date"]
                     new_shift_date = st.date_input("Нова дата за този урок:", value=default_shift_date, key=f"shiftdate_{cal_cls}")
@@ -1249,9 +1385,9 @@ with tab_cal:
                     st.caption(f"💡 Предложение: изглежда има ненужна разлика от урок №{suggested_anchor} нататък.")
                     default_idx = min(suggested_anchor - 1, len(seq_options) - 1)
                     compact_choice = st.selectbox(
-                        "Уплътни от урок:", options=seq_options, key=f"compact_{cal_cls}", index=default_idx
+                        "Уплътни от урок:", options=seq_options, key=f"compact_choice_{cal_cls}", index=default_idx
                     )
-                    compact_seq = int(compact_choice.split("—")[0].replace("№", "").strip())
+                    compact_seq = lesson_seq_from_label(compact_choice)
                     if st.button("🗜️ Уплътни от тук нататък", key=f"compactbtn_{cal_cls}"):
                         new_plan, ov = compact_from(plan, compact_seq, cls_schedule, cal_grade, year_end, school_year_start)
                         save_plan(cal_cls, new_plan, topics, action_desc=f"Уплътни от урок №{compact_seq}")
@@ -1269,10 +1405,10 @@ with tab_cal:
                 swp_col1, swp_col2 = st.columns(2)
                 with swp_col1:
                     swap_a_choice = st.selectbox("Урок А:", options=seq_options, key=f"swapA_{cal_cls}")
-                    swap_a_seq = int(swap_a_choice.split("—")[0].replace("№", "").strip())
+                    swap_a_seq = lesson_seq_from_label(swap_a_choice)
                 with swp_col2:
                     swap_b_choice = st.selectbox("Урок Б:", options=seq_options, key=f"swapB_{cal_cls}", index=min(1, len(seq_options) - 1))
-                    swap_b_seq = int(swap_b_choice.split("—")[0].replace("№", "").strip())
+                    swap_b_seq = lesson_seq_from_label(swap_b_choice)
 
                 if swap_a_seq == swap_b_seq:
                     st.caption("Изберете два различни урока.")
@@ -1291,6 +1427,7 @@ with tab_cal:
                 with st.expander("📋 Пълен списък с уроци (редактирайте дата на конкретен ред)"):
                     df_plan = pd.DataFrame([{
                         "seq": l["seq"],
+                        "Предмет": normalize_subject(l.get("subject")),
                         "Тема": l["topic"],
                         "Вид": l["vid"],
                         "Дата": l["date"],
@@ -1299,6 +1436,7 @@ with tab_cal:
                         df_plan,
                         column_config={
                             "seq": st.column_config.NumberColumn("№", disabled=True),
+                            "Предмет": st.column_config.TextColumn("Предмет", disabled=True),
                             "Тема": st.column_config.TextColumn("Тема", disabled=True),
                             "Вид": st.column_config.TextColumn("Вид", disabled=True),
                             "Дата": st.column_config.DateColumn("Дата", format="DD.MM.YYYY"),
@@ -1316,7 +1454,7 @@ with tab_cal:
                         st.session_state[f"flash_{cal_cls}"] = ("success", "Запазено!")
                         st.rerun()
 
-                if st.button("♻️ Нулирай към стойностите от .docx (изтрива всички ръчни промени за този клас)", key=f"reset_{cal_cls}"):
+                if st.button("♻️ Нулирай към стойностите от .docx (изтрива всички ръчни промени за този клас)", key=f"reset_standalone_{cal_cls}"):
                     new_plan, _ov, _hm = load_or_generate_plan(cal_cls, topics, cls_schedule, school_year_start, year_end, cal_grade, force_regenerate=True, action_desc="Нулиране по .docx")
                     st.session_state[f"flash_{cal_cls}"] = (
                         "success", f"Графикът за {cal_cls} е нулиран по текущия .docx."
@@ -1326,7 +1464,7 @@ with tab_cal:
 with tab3:
     st.header("📥 Експорт")
     if 'filtered_df' in locals() and not filtered_df.empty:
-        export_cols = [c for c in ["Клас", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in filtered_df.columns]
+        export_cols = [c for c in ["Клас", "Предмет", "Раздел", "Раздел / Тема", "Основна дата", "Ден", "Резервна дата"] if c in filtered_df.columns]
         col_x1, col_x2 = st.columns(2)
         with col_x1:
             csv_d = filtered_df[export_cols].to_csv(index=False).encode('utf-8-sig')

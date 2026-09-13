@@ -6,10 +6,12 @@ Version: v26. Single-file Streamlit app (`app.py`, ~1345 lines) +
 
 ## What this is
 Streamlit app for a Bulgarian math teacher. Reads:
-1. Official MON yearly thematic distribution (`.docx`, one per grade) —
-   every lesson numbered (1..180 for grade 7) with topic + lesson type.
-2. Weekly schedule (`schedule_config.json`) — which weekday(s)/hours each
-   class (7.А, 7.Б, ...) has math.
+1. Official yearly distributions (`.docx`, one per grade and subject) — files
+  are `<grade>_<subject>.docx`; legacy `<grade>.docx` means `MAT`.
+  MAT uses the MON numbered lesson table. ИУЧ uses the six-column
+  `№ по ред | Учебна седмица | Тема | Очакван резултат | ...` table.
+2. Weekly schedule (`schedule_config.json`) — hours and subject per weekday
+  for each class.
 
 Produces a per-class calendar mapping every lesson to a real date,
 respecting the official MON holiday calendar. "Контрол и оценка" (test)
@@ -40,11 +42,9 @@ move/swap/compact/undo lessons, and export to CSV/Excel.
   before touching either.
 
 ## Core data model
-Lesson dict (from `parse_docx_distribution`): `{seq, topic, hours=1,
-vid, theme, is_exam}`. `vid` = MON lesson-type label: "Нови знания" |
-"Упражнение" | "Преговор" | "Обобщение" | "Практически дейности" |
-"Контрол и оценка". `is_exam` = `"онтрол" in vid`. One row = one 1-hour
-lesson.
+Lesson dict: `{seq, topic, hours=1, vid, theme, is_exam, subject}`;
+ИУЧ may also contain `expected_result`. `subject` is the normalized short
+label (`MAT`, `ИУЧ`, etc.). One row = one 1-hour lesson.
 
 Legacy fallback: old 2-col docx ("Тема | Часове") still parses (no
 `vid`) but only feeds the flat table tab — no calendar, sync, undo, or
@@ -66,6 +66,8 @@ format.
   output length always equals the input length; `overflow=True` still
   signals the "doesn't fit" warning. (This silent-drop was a real bug,
   fixed once already — don't reintroduce it.)
+- `cls_schedule["_subjects"][weekday]` stores the subject for each slot;
+  never fill a slot with a different subject. Skip non-matching slots.
 - `simulate_plan(topics, ...)` = `_simulate_forward(topics, start_date,
   ..., hours_used_on_start_date=0)` — the "from scratch" case.
 - `_resync_from_index(plan, idx, cls_schedule, grade_str, year_end,
@@ -78,11 +80,9 @@ format.
 
 ## Persistence + change detection
 - `compute_plan_signature(topics)` = `compute_topics_hash(topics) + ":" +
-  compute_calendar_signature()`. Calendar signature hashes CAL
-  (vacations/single-days/end-of-year) + `CUSTOM_DAYS` — so ANY calendar
-  edit or custom-day change also invalidates the cache, not just docx
-  edits. (Originally only hashed docx; caused a silent-staleness bug
-  once — keep both folded in if you add more calendar-like state.)
+  `compute_calendar_signature()`. Hashes include lesson subject, class
+  subject/weekday schedule, official/custom calendar, and planning start
+  date. Any of these changes invalidates the cache.
 - `load_or_generate_plan(cls, topics, cls_schedule, start_date, year_end,
   grade_str, force_regenerate=False, action_desc=None)` → `(plan,
   overflow, hash_mismatch)`. No saved plan → generate + save. Saved plan
@@ -166,6 +166,11 @@ reason}` (elections etc.), managed via a sidebar form (add + 🗑️ delete
 per entry), sidebar section "🗳️ 3. Извънредни неучебни дни". Checked
 first in both `is_school_day()` and `vacation_reason()`. Applies to ALL
 classes/grades uniformly.
+
+## Start date
+Official school-year start is `CAL["start"]` (15 September for 2026/27).
+`planning_start_date` defaults to 16 September because no lessons are placed
+on the opening day. It is session-persisted and included in the plan hash.
 
 ## Calendar rendering
 `render_month_calendar` builds raw HTML via `st.markdown(...,
